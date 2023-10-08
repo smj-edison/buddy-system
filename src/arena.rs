@@ -2,7 +2,10 @@ use std::{iter::repeat_with, ops::Range, sync::mpsc, time::Instant};
 
 use generational_arena::{Arena, Index};
 
-use crate::buddy::{self, is_pow_of_two, Node, NodeState};
+use crate::{
+    buddy::{self, is_pow_of_two, Block, BlockState},
+    pretty_print::prettify,
+};
 
 /// NOT Copy or Clone, to make sure it's unique
 #[derive(Debug)]
@@ -26,30 +29,36 @@ impl Drop for Allocation {
     }
 }
 
-pub struct BuddyIndexManager {
-    pub(crate) nodes: Arena<Node>,
-    root: Index,
+pub struct BuddyBookkeeping {
+    pub(crate) blocks: Arena<Block>,
+    pub(crate) root: Index,
     to_remove_sender: mpsc::Sender<Index>,
     to_remove_receiver: mpsc::Receiver<Index>,
+    min_block_size: usize,
+    max_block_size: usize,
 }
 
-impl BuddyIndexManager {
-    pub fn new(size: usize) -> BuddyIndexManager {
+impl BuddyBookkeeping {
+    pub fn new(size: usize, min_block_size: usize, max_block_size: usize) -> BuddyBookkeeping {
         assert!(is_pow_of_two(size));
+        assert!(max_block_size <= size);
+        assert!(min_block_size <= max_block_size);
 
         let mut new_arena = Arena::new();
-        let root = new_arena.insert(Node {
+        let root = new_arena.insert(Block {
             range: 0..size,
-            state: NodeState::Available,
+            state: BlockState::Available,
         });
 
         let (sender, receiver) = mpsc::channel();
 
-        BuddyIndexManager {
+        BuddyBookkeeping {
             to_remove_sender: sender,
             to_remove_receiver: receiver,
-            nodes: new_arena,
+            blocks: new_arena,
             root: root,
+            min_block_size,
+            max_block_size,
         }
     }
 
@@ -58,37 +67,43 @@ impl BuddyIndexManager {
             count
         } else {
             2_u32.pow(count.ilog2() + 1) as usize
-        };
+        }
+        .max(self.min_block_size)
+        .min(self.max_block_size);
 
-        println!("best size: {}", best_size);
+        if best_size < count {
+            return None;
+        }
 
-        buddy::alloc(&mut self.nodes, self.root, best_size).map(|x| Allocation {
+        buddy::alloc(&mut self.blocks, self.root, best_size).map(|x| Allocation {
             index: x,
-            range: (self.nodes[x].range.start)..(self.nodes[x].range.start + count),
+            range: (self.blocks[x].range.start)..(self.blocks[x].range.start + count),
             to_remove: self.to_remove_sender.clone(),
         })
     }
 
     pub fn tidy(&mut self) {
         while let Ok(index) = self.to_remove_receiver.try_recv() {
-            buddy::dealloc(&mut self.nodes, index);
+            buddy::dealloc(&mut self.blocks, index);
         }
 
-        buddy::tidy(&mut self.nodes, self.root);
+        buddy::tidy(&mut self.blocks, self.root);
     }
 
-    pub fn tidy_gas(&mut self, mut gas: usize) {
+    pub fn tidy_gas(&mut self, gas: usize) {
+        let mut gas = gas;
+
         while let Ok(index) = self.to_remove_receiver.try_recv() {
             if gas == 0 {
                 return;
             }
 
-            buddy::dealloc(&mut self.nodes, index);
+            buddy::dealloc(&mut self.blocks, index);
 
             gas -= 1;
         }
 
-        buddy::tidy_gas(&mut self.nodes, self.root, gas);
+        buddy::tidy_gas(&mut self.blocks, self.root, &mut gas);
     }
 
     pub fn tidy_timed(&mut self, deadline: Instant) {
@@ -97,33 +112,33 @@ impl BuddyIndexManager {
                 return;
             }
 
-            buddy::dealloc(&mut self.nodes, index);
+            buddy::dealloc(&mut self.blocks, index);
         }
 
-        buddy::tidy_timed(&mut self.nodes, self.root, deadline);
+        buddy::tidy_timed(&mut self.blocks, self.root, deadline);
     }
 }
 
-pub struct BuddyArena<T, const N: usize> {
-    elements: [T; N],
-    manager: BuddyIndexManager,
+pub struct BuddyArena<T> {
+    elements: Box<[T]>,
+    bookkeeping: BuddyBookkeeping,
 }
 
-impl<T, const N: usize> BuddyArena<T, N> {
-    pub fn new() -> BuddyArena<T, N>
+impl<T> BuddyArena<T> {
+    pub fn new(size: usize, min_block_size: usize, max_block_size: usize) -> BuddyArena<T>
     where
         T: Default,
     {
-        let elements_vec: Vec<T> = repeat_with(|| T::default()).take(N).collect();
-        let elements: [T; N] = match elements_vec.try_into() {
-            Ok(elements) => elements,
-            Err(_) => unreachable!(),
-        };
+        let elements_vec: Vec<T> = repeat_with(|| T::default()).take(size).collect();
 
         BuddyArena {
-            elements,
-            manager: BuddyIndexManager::new(N),
+            elements: elements_vec.into(),
+            bookkeeping: BuddyBookkeeping::new(size, min_block_size, max_block_size),
         }
+    }
+
+    pub fn bookkeeping(&self) -> &BuddyBookkeeping {
+        &self.bookkeeping
     }
 
     pub fn view(&self, a: &Allocation) -> &[T] {
@@ -135,25 +150,34 @@ impl<T, const N: usize> BuddyArena<T, N> {
     }
 
     pub fn alloc(&mut self, count: usize) -> Option<Allocation> {
-        self.manager.alloc(count)
+        self.bookkeeping.alloc(count)
     }
 
     pub fn tidy(&mut self) {
-        self.manager.tidy();
+        self.bookkeeping.tidy();
     }
 
     pub fn tidy_gas(&mut self, gas: usize) {
-        self.manager.tidy_gas(gas);
+        self.bookkeeping.tidy_gas(gas);
     }
 
     pub fn tidy_timed(&mut self, deadline: Instant) {
-        self.manager.tidy_timed(deadline);
+        self.bookkeeping.tidy_timed(deadline);
     }
 }
 
 #[test]
 fn test() {
-    let mut arena: BuddyArena<u8, 512> = BuddyArena::new();
+    let mut arena: BuddyArena<u8> = BuddyArena::new(2048, 8, 256);
+
+    let a1 = arena.alloc(64).unwrap();
+    let a2 = arena.alloc(24).unwrap();
+    let a3 = arena.alloc(2).unwrap();
+    let a4 = arena.alloc(7).unwrap();
+    let a5 = arena.alloc(31).unwrap();
+    let a6 = arena.alloc(60).unwrap();
+
+    println!("{:#?}", prettify(arena.bookkeeping()));
 
     let string = "foobar";
 

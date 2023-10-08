@@ -7,31 +7,31 @@ pub mod pretty_print {
     use generational_arena::{Arena, Index};
 
     use crate::{
-        arena::BuddyIndexManager,
-        buddy::{Node, NodeState},
+        arena::BuddyBookkeeping,
+        buddy::{Block, BlockState},
     };
 
     #[derive(Debug)]
     pub enum PrettyState {
-        Split(Box<PrettyNode>, Box<PrettyNode>),
+        Split(Box<PrettyBlock>, Box<PrettyBlock>),
         Available,
         Occupied,
     }
 
     #[derive(Debug)]
-    pub struct PrettyNode {
+    pub struct PrettyBlock {
         pub range: Range<usize>,
         pub state: PrettyState,
     }
 
-    pub fn prettify(arena: &BuddyIndexManager, root: Index) -> PrettyNode {
-        fn build(arena: &Arena<Node>, current: Index) -> PrettyNode {
-            PrettyNode {
+    pub fn prettify(arena: &BuddyBookkeeping) -> PrettyBlock {
+        fn build(arena: &Arena<Block>, current: Index) -> PrettyBlock {
+            PrettyBlock {
                 range: arena[current].range.clone(),
                 state: match arena[current].state {
-                    NodeState::Available => PrettyState::Available,
-                    NodeState::Occupied => PrettyState::Occupied,
-                    NodeState::Split(first, second) => PrettyState::Split(
+                    BlockState::Available => PrettyState::Available,
+                    BlockState::Occupied => PrettyState::Occupied,
+                    BlockState::Split(first, second) => PrettyState::Split(
                         Box::new(build(arena, first)),
                         Box::new(build(arena, second)),
                     ),
@@ -39,6 +39,6 @@ pub mod pretty_print {
             }
         }
 
-        build(&arena.nodes, root)
+        build(&arena.blocks, arena.root)
     }
 }
